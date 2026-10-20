@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import logging
 import tarfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -12,6 +13,8 @@ from typing import Any, Iterable
 
 import h5py
 import numpy as np
+
+from headpose.decoder import ReplayDecoder
 
 # ============================================================
 # Challenge settings and result types
@@ -112,62 +115,69 @@ class TarPreprocessor:
         """Decode XROR bytes into seconds and normalized (w,x,y,z) quaternions."""
 
         try:
-            from xror import XROR
+            import bson
+            import fpzip
         except ImportError as error:
             raise RuntimeError(
-                "Install the project's XROR dependency to read .xror files"
+                "Install the project's pymongo and fpzip dependencies to read .xror files"
             ) from error
 
         # ----------------------------------------
         # Decode the replay and locate head rotation columns
         # ----------------------------------------
 
-        recording = XROR.unpack(data).data
+        recording = bson.decode(data)
         devices = recording.get("info", {}).get("hardware", {}).get("devices", [])
-        frames = recording.get("frames", [])
-        if not devices or not frames:
+        packed_frames = recording.get("frames")
+        if not devices or packed_frames is None:
             raise ValueError("XROR replay has no devices or motion frames")
 
         indices = cls._head_quaternion_indices(devices)
 
-        # ----------------------------------------
-        # Validate and normalize each sample
-        # ----------------------------------------
+        # XROR stores the frame matrix inside singleton fpzip dimensions.
+        # Event streams are not needed for the head-motion filter.
+        frames = np.asarray(fpzip.decompress(packed_frames))
+        while frames.ndim > 2 and frames.shape[0] == 1:
+            frames = frames[0]
 
-        timestamps: list[float] = []
-        quaternions: list[tuple[float, float, float, float]] = []
-        invalid = 0
-
-        for frame in frames:
-            try:
-                timestamp = float(frame[0])
-                quaternion = np.asarray(
-                    [float(frame[index]) for index in indices], dtype=np.float64
-                )
-                norm = float(np.linalg.norm(quaternion))
-
-                if (
-                    not math.isfinite(timestamp)
-                    or not np.isfinite(quaternion).all()
-                    or norm < MIN_QUATERNION_NORM
-                ):
-                    raise ValueError("invalid timestamp or quaternion")
-
-                timestamps.append(timestamp)
-                quaternions.append(tuple((quaternion / norm).tolist()))
-            except (TypeError, ValueError, IndexError, OverflowError):
-                invalid += 1
-
-        if not timestamps:
+        if frames.ndim != 2:
+            raise ValueError("XROR motion frames must form a two-dimensional matrix")
+        if not len(frames):
+            raise ValueError("XROR replay has no devices or motion frames")
+        if frames.shape[1] <= max(indices):
             raise ValueError("XROR replay has no valid head quaternion samples")
+
+        # ----------------------------------------
+        # Validate and normalize all samples together
+        # ----------------------------------------
+
+        # Malformed frames can contain signaling NaNs or overflowing norms.
+        # Reject them through the validity mask without emitting NumPy warnings.
+        with np.errstate(invalid="ignore", over="ignore"):
+            timestamps = frames[:, 0].astype(np.float64)
+            quaternions = frames[:, list(indices)].astype(np.float64)
+            norms = np.linalg.norm(quaternions, axis=1)
+        valid = (
+            np.isfinite(timestamps)
+            & np.isfinite(quaternions).all(axis=1)
+            & np.isfinite(norms)
+            & (norms >= MIN_QUATERNION_NORM)
+        )
+        invalid = int((~valid).sum())
+
+        if not valid.any():
+            raise ValueError("XROR replay has no valid head quaternion samples")
+
+        timestamps = timestamps[valid]
+        quaternions = quaternions[valid] / norms[valid, None]
 
         # ----------------------------------------
         # Sort by time and remove duplicate timestamps
         # ----------------------------------------
 
-        order = np.argsort(np.asarray(timestamps), kind="stable")
-        times = np.asarray(timestamps, dtype=np.float64)[order]
-        values = np.asarray(quaternions, dtype=np.float64)[order]
+        order = np.argsort(timestamps, kind="stable")
+        times = timestamps[order]
+        values = quaternions[order]
         unique = np.concatenate(([True], np.diff(times) > 0.0))
         invalid += int((~unique).sum())
 
@@ -288,28 +298,33 @@ class TarPreprocessor:
         # ----------------------------------------
 
         angles = cls._to_euler_xyz(trimmed_quaternions)
-        sweep_windows: list[list[float]] = [[], [], []]
-        velocity_windows: list[list[float]] = [[], [], []]
+        sweep_windows: list[np.ndarray] = []
+        velocity_windows: list[np.ndarray] = []
         window_count = 0
         duration = float(trimmed_times[-1])
         window_start = 0.0
 
         while window_start < duration:
             window_end = min(window_start + FILTER_WINDOW_SECONDS, duration)
-            mask = (trimmed_times >= window_start) & (
-                trimmed_times < window_start + FILTER_WINDOW_SECONDS
+            left, right = np.searchsorted(
+                trimmed_times,
+                [window_start, window_start + FILTER_WINDOW_SECONDS],
+                side="left",
             )
 
-            if int(mask.sum()) >= MIN_WINDOW_SAMPLES:
+            if right - left >= MIN_WINDOW_SAMPLES:
                 window_count += 1
                 window_duration = max(window_end - window_start, 1.0 / rate)
 
-                for axis in range(3):
-                    values = angles[mask, axis]
-                    sweep = cls._percentile(values, 90) - cls._percentile(values, 10)
-                    velocity = cls._wrapped_velocity(values, window_duration)
-                    sweep_windows[axis].append(sweep)
-                    velocity_windows[axis].append(velocity)
+                # Contiguous rows retain the per-axis reduction order.
+                values = np.ascontiguousarray(angles[left:right].T)
+                p10, p90 = np.percentile(values, [10, 90], axis=1, method="linear")
+                differences = np.abs(np.diff(values, axis=1))
+                differences = np.where(
+                    differences > 180.0, 360.0 - differences, differences
+                )
+                sweep_windows.append(p90 - p10)
+                velocity_windows.append(differences.sum(axis=1) / window_duration)
 
             window_start += FILTER_WINDOW_SECONDS
 
@@ -328,10 +343,8 @@ class TarPreprocessor:
         # Aggregate window scores and apply thresholds
         # ----------------------------------------
 
-        axis_sweeps = [float(np.median(values)) for values in sweep_windows if values]
-        axis_velocities = [float(np.median(values)) for values in velocity_windows if values]
-        sweep = max(axis_sweeps)
-        velocity = max(axis_velocities)
+        sweep = float(np.median(sweep_windows, axis=0).max())
+        velocity = float(np.median(velocity_windows, axis=0).max())
 
         # This project follows the challenge overview's inclusive thresholds.
         if sweep < SWEEP_MIN_DEG:
@@ -351,13 +364,23 @@ class TarPreprocessor:
     def _align_hemispheres(quaternions: np.ndarray) -> np.ndarray:
         """Flip quaternion signs so adjacent samples stay in the same hemisphere."""
 
-        aligned = quaternions.copy()
+        if len(quaternions) < 2:
+            return quaternions.copy()
 
-        for index in range(1, len(aligned)):
-            if float(np.dot(aligned[index - 1], aligned[index])) < 0.0:
-                aligned[index] *= -1.0
+        dots = np.einsum("ij,ij->i", quaternions[:-1], quaternions[1:])
+        # Preserve the scalar decision for nearly orthogonal pairs.
+        for index in np.flatnonzero(np.abs(dots) < 1e-14):
+            dots[index] = np.dot(quaternions[index], quaternions[index + 1])
 
-        return aligned
+        signs = np.concatenate(([1.0], np.cumprod(np.where(dots < 0.0, -1.0, 1.0))))
+
+        # At an exactly orthogonal pair, the original loop keeps the raw sign.
+        resets = np.maximum.accumulate(
+            np.where(dots == 0.0, np.arange(1, len(quaternions)), 0)
+        )
+        signs = signs * signs[np.concatenate(([0], resets))]
+
+        return quaternions * signs[:, None]
 
     @staticmethod
     def _slerp(first: np.ndarray, second: np.ndarray, fraction: float) -> np.ndarray:
@@ -383,6 +406,42 @@ class TarPreprocessor:
         )
 
         return result / np.linalg.norm(result)
+
+    @staticmethod
+    def _slerp_batch(
+        first: np.ndarray,
+        second: np.ndarray,
+        fractions: np.ndarray,
+    ) -> np.ndarray:
+        """Apply the scalar SLERP rules to several quaternion pairs at once."""
+
+        dots = np.einsum("ij,ij->i", first, second)
+        second = np.where((dots < 0.0)[:, None], -second, second)
+        dots = np.clip(np.abs(dots), 0.0, 1.0)
+        linear = dots > 0.9995
+        output = np.empty_like(first)
+
+        # ----------------------------------------
+        # Interpolate nearly identical orientations linearly
+        # ----------------------------------------
+
+        output[linear] = first[linear] + fractions[linear, None] * (
+            second[linear] - first[linear]
+        )
+
+        # ----------------------------------------
+        # Interpolate other pairs along the quaternion sphere and normalize
+        # ----------------------------------------
+
+        angles = np.arccos(dots[~linear])
+        weights = fractions[~linear]
+        denominator = np.sin(angles)
+        output[~linear] = (
+            (np.sin((1.0 - weights) * angles) / denominator)[:, None] * first[~linear]
+            + (np.sin(weights * angles) / denominator)[:, None] * second[~linear]
+        )
+
+        return output / np.linalg.norm(output, axis=1, keepdims=True)
 
     @classmethod
     def _resample_segment(
@@ -414,21 +473,20 @@ class TarPreprocessor:
         # Interpolate orientation for each grid point
         # ----------------------------------------
 
-        output = np.empty((len(grid), 4), dtype=np.float32)
-
-        for index, target in enumerate(grid):
-            right = int(np.searchsorted(times, target, side="left"))
-
-            if right == 0:
-                output[index] = quaternions[0]
-            elif right >= len(times):
-                output[index] = quaternions[-1]
-            elif times[right] == target:
-                output[index] = quaternions[right]
-            else:
-                left = right - 1
-                fraction = float((target - times[left]) / (times[right] - times[left]))
-                output[index] = cls._slerp(quaternions[left], quaternions[right], fraction)
+        right = np.searchsorted(times, grid, side="left")
+        bounded_right = np.minimum(right, len(times) - 1)
+        output = quaternions[bounded_right].astype(np.float32)
+        interpolate = (
+            (right > 0)
+            & (right < len(times))
+            & (times[bounded_right] != grid)
+        )
+        right = right[interpolate]
+        left = right - 1
+        fractions = (grid[interpolate] - times[left]) / (times[right] - times[left])
+        output[interpolate] = cls._slerp_batch(
+            quaternions[left], quaternions[right], fractions
+        )
 
         return grid, output
 
@@ -516,7 +574,7 @@ class TarPreprocessor:
             if not replay_members:
                 raise ValueError(f"No .xror replay files found in {archive_path}")
 
-            with h5py.File(output_path, "w") as h5:
+            with ReplayDecoder() as decoder, h5py.File(output_path, "w") as h5:
                 h5.attrs["source_archive"] = archive_path.name
                 h5.attrs["quaternion_order"] = "w,x,y,z"
                 h5.attrs["sampling_rate_hz"] = self.output_rate_hz
@@ -535,6 +593,7 @@ class TarPreprocessor:
                         sessions_group,
                         archive_user,
                         len(results),
+                        decoder,
                     )
                     results.append(result)
 
@@ -547,6 +606,7 @@ class TarPreprocessor:
         sessions_group: h5py.Group,
         user_id: str,
         replay_index: int,
+        decoder: ReplayDecoder,
     ) -> ReplayResult:
         """Read, filter, clean, and optionally write one replay."""
 
@@ -566,7 +626,7 @@ class TarPreprocessor:
             with source:
                 raw = source.read()
 
-            times, quaternions, count, invalid = self.read_xror(raw)
+            times, quaternions, count, invalid = decoder.decode(raw)
             result.sample_count = count
             result.valid_sample_count = len(times)
             result.invalid_sample_count = invalid
@@ -633,6 +693,9 @@ class TarPreprocessor:
         except Exception as error:
             result.kept = False
             result.reason = f"processing error: {error}"
+            logging.getLogger("headpose.downloader").warning(
+                "Replay failed in %s: %s: %s", archive.name, member.name, error
+            )
 
         return result
 

@@ -288,6 +288,7 @@ name = "headpose"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "fpzip" },
     { name = "h5py" },
     { name = "huggingface-hub" },
     { name = "numpy" },
@@ -304,6 +305,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "fpzip", specifier = ">=1.2.5" },
     { name = "h5py", specifier = ">=3.15.0" },
     { name = "huggingface-hub", specifier = ">=2.2.0" },
     { name = "numpy", specifier = ">=2.5.0" },

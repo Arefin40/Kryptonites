@@ -10,7 +10,9 @@ import json
 import logging
 import os
 import shutil
+import sys
 import tempfile
+import threading
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,9 @@ from tqdm import tqdm
 
 from headpose.preprocess import OUTPUT_RATE_HZ, ReplayResult, TarPreprocessor
 
+# This downloader uses threads, so tqdm only needs a thread lock.
+tqdm.set_lock(threading.RLock())
+
 # ============================================================
 # Dataset selection
 # ============================================================
@@ -33,6 +38,7 @@ USER_FOLDER = "users/d"
 OUTPUT_DIR = Path("data/processed")
 LOG_DIR = Path("logs")
 MAX_WORKERS = 2
+DOWNLOAD_PROGRESS_MIN_BYTES = 100 * 1024 * 1024
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 load_dotenv(PROJECT_ROOT / ".env")
@@ -44,12 +50,44 @@ HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
 # ============================================================
 
 
+class DownloadProgressBar(tqdm):
+    """Show byte-transfer progress for archives of at least 100 MiB."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        total = kwargs.get("total")
+        description = str(kwargs.get("desc", ""))
+
+        # ----------------------------------------
+        # Keep small downloads and reconstruction quiet
+        # ----------------------------------------
+
+        kwargs["disable"] = (
+            total is None
+            or total < DOWNLOAD_PROGRESS_MIN_BYTES
+            or "reconstructing file" in description
+        )
+        if not kwargs["disable"]:
+            kwargs["disable"] = None  # Avoid terminal control codes in redirected logs.
+
+        # Each concurrent transfer gets its own available row below the overall bar.
+        kwargs.pop("position", None)
+        kwargs["desc"] = f"Download {Path(description.split(':', 1)[0]).name[:12]}"
+        kwargs["bar_format"] = (
+            "{desc}: {bar:12} {n_fmt}B [{elapsed}, {rate_fmt}]"
+        )
+        kwargs["dynamic_ncols"] = True
+        kwargs["leave"] = False
+        kwargs["mininterval"] = 0.5
+
+        super().__init__(*args, **kwargs)
+
+
 class TqdmLoggingHandler(logging.Handler):
     """Write log records without breaking the active tqdm progress bar."""
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            tqdm.write(self.format(record))
+            tqdm.write(self.format(record), file=sys.stderr)
         except Exception:
             self.handleError(record)
 
@@ -105,7 +143,7 @@ class RemoteUserPreprocessor:
         if max_workers < 1:
             raise ValueError("max_workers must be at least 1")
 
-        # Hide Hub download/reconstruction bars; keep our overall tqdm progress.
+        # Hide default Hub bars; downloads use our size-aware custom tqdm class.
         disable_progress_bars()
 
         self.repo_id = repo_id
@@ -367,6 +405,7 @@ class RemoteUserPreprocessor:
                     revision=resolved_revision,
                     cache_dir=temporary_root / "hub-cache",
                     token=self.token,
+                    tqdm_class=DownloadProgressBar,
                 )
             )
             temporary_h5 = temporary_root / "archive.h5"
@@ -506,6 +545,7 @@ class RemoteUserPreprocessor:
             desc=f"{user_folder} archives",
             unit="tar",
             dynamic_ncols=True,
+            position=0,
         )
 
         for entry in archives:
@@ -546,6 +586,11 @@ class RemoteUserPreprocessor:
             row for row in manifest_rows if row.get("source_tar") not in pending_paths
         ]
         self._write_manifest(manifest_path, manifest_rows)
+        # Resume skips must not inflate the processing rate or shorten its ETA.
+        progress.reset(total=len(archives))
+        progress.n = skipped
+        progress.last_print_n = skipped
+        progress.refresh()
         progress.set_postfix(done=processed, skipped=skipped, failed=failed)
 
         self.logger.info(
