@@ -1,0 +1,35 @@
+[project]
+name = "headpose"
+version = "0.1.0"
+description = "ABC2027 - Head Pose Estimation Challenge"
+readme = "README.md"
+authors = [
+    { name = "Shahriar", email = "arfin17310@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "huggingface-hub>=2.2.0",
+    "h5py>=3.15.0",
+    "numpy>=2.5.0",
+    "pymongo>=4.19.0",
+    "python-dotenv>=1.0.0",
+    "tqdm>=4.66.0",
+    "xror",
+]
+
+[project.scripts]
+headpose = "headpose:main"
+headpose-preprocess = "headpose.preprocess:main"
+headpose-download = "headpose.downloader:main"
+
+[build-system]
+requires = ["uv_build>=0.8.18,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+xror = { git = "https://github.com/MetaGuard/xror.git" }
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+]
