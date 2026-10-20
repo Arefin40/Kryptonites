@@ -22,6 +22,7 @@ dependencies = [
 headpose = "headpose:main"
 headpose-preprocess = "headpose.preprocess:main"
 headpose-download = "headpose.downloader:main"
+headpose-local = "headpose.local:main"
 
 [build-system]
 requires = ["uv_build>=0.8.18,<0.9.0"]

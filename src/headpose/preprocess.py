@@ -61,14 +61,20 @@ class TarPreprocessor:
         *,
         max_gap_seconds: float = 0.1,
         output_rate_hz: float = OUTPUT_RATE_HZ,
+        min_training_samples: int = MIN_TRAINING_SAMPLES,
+        strict_motion_thresholds: bool = False,
     ) -> None:
         if max_gap_seconds <= 0.0:
             raise ValueError("max_gap_seconds must be positive")
         if output_rate_hz <= 0.0:
             raise ValueError("output_rate_hz must be positive")
+        if min_training_samples < MIN_TRAINING_SAMPLES:
+            raise ValueError("min_training_samples must be at least 420")
 
         self.max_gap_seconds = max_gap_seconds
         self.output_rate_hz = output_rate_hz
+        self.min_training_samples = min_training_samples
+        self.strict_motion_thresholds = strict_motion_thresholds
 
     # ============================================================
     # XROR reading and quaternion conversion
@@ -524,7 +530,7 @@ class TarPreprocessor:
                 self.output_rate_hz,
             )
 
-            if len(segment_quaternions) >= MIN_TRAINING_SAMPLES:
+            if len(segment_quaternions) >= self.min_training_samples:
                 segments.append((segment_times, segment_quaternions))
 
         return segments
@@ -580,6 +586,8 @@ class TarPreprocessor:
                 h5.attrs["sampling_rate_hz"] = self.output_rate_hz
                 h5.attrs["sweep_threshold_deg"] = SWEEP_MIN_DEG
                 h5.attrs["velocity_threshold_deg_s"] = VELOCITY_MIN_DEG_S
+                h5.attrs["min_training_samples"] = self.min_training_samples
+                h5.attrs["strict_motion_thresholds"] = self.strict_motion_thresholds
                 sessions_group = h5.create_group("sessions")
 
                 # ----------------------------------------
@@ -640,6 +648,12 @@ class TarPreprocessor:
                 trimmed_quaternions,
             ) = self.assess_session(times, quaternions)
 
+            if self.strict_motion_thresholds and result.reason == "retained":
+                if result.sweep_deg <= SWEEP_MIN_DEG:
+                    result.reason = "sustained sweep must exceed 17 degrees"
+                elif result.velocity_deg_s <= VELOCITY_MIN_DEG_S:
+                    result.reason = "sustained angular velocity must exceed 15 degrees/second"
+
             result.kept = result.reason == "retained"
 
             if not result.kept:
@@ -653,7 +667,10 @@ class TarPreprocessor:
 
             if not segments:
                 result.kept = False
-                result.reason = "no segment has at least 420 samples after cleaning"
+                result.reason = (
+                    f"no segment has at least {self.min_training_samples} "
+                    "samples after cleaning"
+                )
                 return result
 
             replay_key = replay_name
